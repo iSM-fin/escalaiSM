@@ -4,6 +4,11 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
 jobs:
   build_and_preview:
     if: '${{ github.event.pull_request.head.repo.full_name == github.repository }}'
@@ -14,10 +19,17 @@ jobs:
         uses: actions/setup-node@v3
         with:
             node-version: 18
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v1
+        with:
+          workload_identity_provider: 'projects/24608035306/locations/global/workloadIdentityPools/github/providers/my-repo'
+          service_account: 'github-deploy@escala-ism.iam.gserviceaccount.com'
+
       - run: npm ci
       - run: npm run build
       - uses: FirebaseExtended/action-hosting-deploy@v0
         with:
           repoToken: '${{ secrets.GITHUB_TOKEN }}'
-          firebaseServiceAccount: '${{ secrets.FIREBASE_SERVICE_ACCOUNT_ESCALA_ISM }}'
+          firebaseServiceAccount: 'github-deploy@escala-ism.iam.gserviceaccount.com'
           projectId: escala-ism
