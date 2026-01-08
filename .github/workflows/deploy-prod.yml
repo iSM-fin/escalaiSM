@@ -21,6 +21,7 @@ jobs:
              node-version: 22
       
       - name: Authenticate to Google Cloud
+        id: auth
         uses: google-github-actions/auth@v1
         with:
           workload_identity_provider: 'projects/24608035306/locations/global/workloadIdentityPools/github/providers/my-repo'
@@ -31,5 +32,7 @@ jobs:
       
       - name: Deploy to Firebase (Hosting + Rules)
         run: npx firebase-tools deploy --project escala-ism --only hosting,firestore:rules --force
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ steps.auth.outputs.credentials_file_path }}
 
 
