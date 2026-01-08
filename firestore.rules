@@ -1,0 +1,65 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // --- FUNCTIONS ---
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Bootstrap emails - Only these can bypass restrictions during CREATE/UPDATE of profiles if needed.
+    // However, we strictly lock the 'role' field update for everyone except existing admins.
+    function isSystemAdmin() {
+      return request.auth.token.email in ['financeiro@ismsaude.com', 'admin@teste.com'];
+    }
+
+    // Check role in DB
+    function isStoredAdmin() {
+      return isAuthenticated() && 
+             exists(/databases/$(database)/documents/user_profiles/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/user_profiles/$(request.auth.uid)).data.role == 'ADM';
+    }
+
+    function isAdmin() {
+      return isSystemAdmin() || isStoredAdmin();
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // --- COLLECTIONS ---
+
+    match /user_profiles/{userId} {
+      // Read: Public for authenticated users (names are needed for schedule display)
+      allow read: if isAuthenticated();
+
+      // Create: Owner can create their profile.
+      // Constraint: Role must be 'MEDICO' (default) unless it's a System Admin.
+      // This prevents a malicious client from sending role: 'ADM'.
+      allow create: if isOwner(userId) && (
+        isSystemAdmin() || 
+        (request.resource.data.role == 'MEDICO' && !('doctorName' in request.resource.data))
+      );
+
+      // Update: Owner can update non-privileged fields.
+      // Role and DoctorName are PROTECTED.
+      allow update: if isAdmin() || (isOwner(userId) && (
+        request.resource.data.role == resource.data.role &&
+        request.resource.data.doctorName == resource.data.doctorName
+      ));
+      
+      allow delete: if isAdmin();
+    }
+
+    match /app_data/schedule_store_v1 {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+    
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
