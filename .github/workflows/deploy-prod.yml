@@ -25,6 +25,7 @@ jobs:
         with:
           workload_identity_provider: 'projects/24608035306/locations/global/workloadIdentityPools/github/providers/my-repo'
           service_account: 'github-deploy@escala-ism.iam.gserviceaccount.com'
+          audience: 'https://iam.googleapis.com/projects/24608035306/locations/global/workloadIdentityPools/github/providers/my-repo'
 
       - run: npm ci
       - run: npm run build
