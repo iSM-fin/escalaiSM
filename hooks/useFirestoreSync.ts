@@ -1,8 +1,13 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react';
-import { doc, onSnapshot, setDoc, getDoc, collection } from 'firebase/firestore';
+import { doc, onSnapshot, setDoc, collection, query, limit, orderBy } from 'firebase/firestore';
 import { db } from '../services/firebase';
 import { ScheduleStore, User } from '../types';
 import { initializeStore } from '../utils/scheduleManager';
+
+// Configurações de retry
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 1000;
+const MAX_USERS_PER_PAGE = 100;
 
 // Helper to recursively remove undefined values (Firestore doesn't support them)
 const sanitizeForFirestore = (obj: any): any => {
@@ -21,16 +26,20 @@ const sanitizeForFirestore = (obj: any): any => {
     return obj;
 };
 
+// Helper para delay em retry
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
 export const useFirestoreSync = (
     currentUser: User | null,
     setStore: React.Dispatch<React.SetStateAction<ScheduleStore>>
 ) => {
-    const [status, setStatus] = useState<'idle' | 'loading' | 'saving' | 'error'>('idle');
+    const [status, setStatus] = useState<'idle' | 'loading' | 'saving' | 'error' | 'retrying'>('idle');
     const [lastRemoteUpdate, setLastRemoteUpdate] = useState<number>(0);
     const [remoteStoreData, setRemoteStoreData] = useState<ScheduleStore | null>(null);
     const [remoteUsers, setRemoteUsers] = useState<User[]>([]);
     const [errorMessage, setErrorMessage] = useState<string | null>(null);
     const [isSynced, setIsSynced] = useState(false);
+    const [retryCount, setRetryCount] = useState(0);
 
     const ignoreNextLocalUpdate = useRef(false);
 
@@ -56,25 +65,20 @@ export const useFirestoreSync = (
                     loadedData = remoteData.data;
                 }
                 // 2. Fallback: Try unwrapped format (root level properties)
-                // This handles cases where data was restored directly to the document root
                 else if (remoteData && (remoteData.doctors || remoteData.months || remoteData.structure)) {
                     console.warn("[Sync] Data found in unwrapped format. Migrating...");
                     loadedData = remoteData;
                 }
                 // 3. Last Resort: Corrupted Doctor List Dump
-                // Screenshot shows root has 'id', 'name', 'type' (single doctor?) + numeric keys.
                 else if (remoteData) {
                     console.warn("[Sync] Data mismatch. Attempting recovery from potential doctor list dump...");
-                    // It seems the DB was overwritten with just the doctors list or a single doctor object mixed with others.
-                    // We try to salvage the values as doctors.
                     const potentialDoctors = Object.values(remoteData).filter((v: any) => v && typeof v === 'object' && v.name && v.type);
 
                     if (potentialDoctors.length > 0) {
-                        console.warn(`[Sync] Recoverd ${potentialDoctors.length} doctors from raw dump. Reinitializing structure.`);
+                        console.warn(`[Sync] Recovered ${potentialDoctors.length} doctors from raw dump. Reinitializing structure.`);
                         loadedData = {
                             ...initializeStore(),
                             doctors: potentialDoctors,
-                            // We preserve defaults for everything else since they are missing
                         };
                     } else {
                         console.error("[Sync] Could not recover any valid data structure.");
@@ -109,12 +113,19 @@ export const useFirestoreSync = (
         return () => unsubscribe();
     }, [currentUser]);
 
-    // 2. Listen to User Profiles (Users Data)
+    // 2. Listen to User Profiles (Users Data) - Com paginação
     useEffect(() => {
         if (!currentUser) return;
 
+        // Query com limite para paginação
         const colRef = collection(db, 'user_profiles');
-        const unsubscribe = onSnapshot(colRef, (snapshot) => {
+        const usersQuery = query(
+            colRef,
+            orderBy('name'),
+            limit(MAX_USERS_PER_PAGE)
+        );
+
+        const unsubscribe = onSnapshot(usersQuery, (snapshot) => {
             const users: User[] = snapshot.docs.map(d => {
                 const data = d.data();
                 return {
@@ -123,7 +134,7 @@ export const useFirestoreSync = (
                     name: data.name || 'Unknown',
                     role: data.role || 'Medico',
                     linkedDoctorId: data.linkedDoctorId || null
-                } as any; // Cast safely or fix types.ts
+                } as User;
             });
             setRemoteUsers(users);
         }, (error) => {
@@ -149,9 +160,8 @@ export const useFirestoreSync = (
                 }));
                 lastAppliedRemoteData.current = remoteDataString;
                 isFirstLoad.current = false;
-            } else if (status !== 'saving' && status !== 'loading') {
-                // Subsequent updates: only apply if data actually changed from what we last applied
-                // This prevents overwriting local changes with stale remote data
+            } else if (status !== 'saving' && status !== 'loading' && status !== 'retrying') {
+                // Subsequent updates: only apply if data actually changed
                 if (remoteDataString !== lastAppliedRemoteData.current) {
                     setStore(prev => ({
                         ...remoteStoreData,
@@ -169,29 +179,64 @@ export const useFirestoreSync = (
     const queuedStoreRef = useRef<ScheduleStore | null>(null);
     const queuedStoreStringRef = useRef<string>('');
 
-    // Save Function (now wrapped in useCallback)
+    // Função auxiliar para executar o save com retry
+    const executeWithRetry = useCallback(async (
+        cleanData: any,
+        stringified: string,
+        attempt: number = 1
+    ): Promise<boolean> => {
+        try {
+            const docRef = doc(db, 'app_data', 'schedule_store_v1');
+            await setDoc(docRef, { data: cleanData });
+            lastSavedDataRef.current = stringified;
+            setRetryCount(0);
+            return true;
+        } catch (error: any) {
+            console.error(`[Sync] Save attempt ${attempt} failed:`, error);
+
+            // Verifica se é um erro de rede ou temporário
+            const isRetryableError =
+                error.code === 'unavailable' ||
+                error.code === 'deadline-exceeded' ||
+                error.code === 'resource-exhausted' ||
+                error.message?.includes('network') ||
+                error.message?.includes('timeout');
+
+            if (isRetryableError && attempt < MAX_RETRIES) {
+                setStatus('retrying');
+                setRetryCount(attempt);
+                const backoffDelay = RETRY_DELAY_MS * Math.pow(2, attempt - 1); // Exponential backoff
+                console.log(`[Sync] Retrying in ${backoffDelay}ms (attempt ${attempt + 1}/${MAX_RETRIES})...`);
+                await delay(backoffDelay);
+                return executeWithRetry(cleanData, stringified, attempt + 1);
+            }
+
+            throw error;
+        }
+    }, []);
+
+    // Save Function com fila e retry
     const saveToFirestore = useCallback(async (newStore: ScheduleStore) => {
         if (!currentUser) return;
 
         // GUARD: Error Proofing - Prevent saving if the store looks catastrophically empty
-        // This prevents the "White Screen" bug from nuking the database.
         if (!newStore.structure || newStore.structure.length === 0) {
             console.error("CRITICAL: Attempted to save invalid store (no structure). Blocked to prevent data loss.");
             return;
         }
-        // If we have doctors but suddenly have 0, block unless it's a fresh init (rare).
-        // Safest is to rely on structure.
 
-        // Normalize data before comparing/saving (Firestore can't store undefined).
+        // Normalize data before comparing/saving
         const cleanData = sanitizeForFirestore(newStore);
         const stringified = JSON.stringify(cleanData);
 
         // Optimization: Don't save if data is identical to last save
         if (stringified === lastSavedDataRef.current) return;
 
+        // Se já existe um save em andamento, adiciona à fila
         if (saveInFlightRef.current) {
             queuedStoreRef.current = newStore;
             queuedStoreStringRef.current = stringified;
+            console.log("[Sync] Save queued (another save in progress)");
             return;
         }
 
@@ -199,25 +244,29 @@ export const useFirestoreSync = (
             saveInFlightRef.current = true;
             setStatus('saving');
             setErrorMessage(null);
-            const docRef = doc(db, 'app_data', 'schedule_store_v1');
 
-            // We deliberately do NOT use { merge: true } here.
-            // Using merge: true would merge nested maps (like 'months'), causing deleted keys to persist.
-            // By overwriting the document (or mainly the 'data' field if we used updateDoc), we ensure deleted data is gone.
-            // Since this document 'schedule_store_v1' is dedicated to this store, overwriting is safe and correct.
-            await setDoc(docRef, { data: cleanData });
-            lastSavedDataRef.current = stringified;
+            // Executa o save com retry automático
+            await executeWithRetry(cleanData, stringified);
+
             setStatus('idle');
         } catch (error: any) {
             console.error("Error saving to Firestore:", error);
-            setErrorMessage(error.message);
+            setErrorMessage(`Erro ao salvar: ${error.message}. Tente novamente.`);
             setStatus('error');
         } finally {
             saveInFlightRef.current = false;
-            // ... processing queue ...
+
+            // Processa a fila se houver dados pendentes
+            if (queuedStoreRef.current && queuedStoreStringRef.current !== lastSavedDataRef.current) {
+                const queuedStore = queuedStoreRef.current;
+                queuedStoreRef.current = null;
+                queuedStoreStringRef.current = '';
+                console.log("[Sync] Processing queued save...");
+                // Chama recursivamente para processar o item da fila
+                saveToFirestore(queuedStore);
+            }
         }
-    }, [currentUser]);
+    }, [currentUser, executeWithRetry]);
 
-    return { status, errorMessage, saveToFirestore, isSynced };
+    return { status, errorMessage, saveToFirestore, isSynced, retryCount };
 };
-

@@ -7,57 +7,125 @@ service cloud.firestore {
       return request.auth != null;
     }
 
-    // Bootstrap emails - Only these can bypass restrictions during CREATE/UPDATE of profiles if needed.
-    // However, we strictly lock the 'role' field update for everyone except existing admins.
-    function isSystemAdmin() {
-      return request.auth.token.email in ['financeiro@ismsaude.com', 'admin@teste.com'];
+    // Verifica Custom Claims do Firebase Auth (configurado via Admin SDK ou Cloud Functions)
+    // Custom claims são a forma segura de definir permissões administrativas
+    function hasAdminClaim() {
+      return request.auth.token.admin == true;
     }
 
-    // Check role in DB
+    // Bootstrap emails - Usados APENAS para setup inicial do sistema
+    // IMPORTANTE: Após configurar Custom Claims, remover estes emails
+    function isBootstrapAdmin() {
+      return request.auth.token.email in ['financeiro@ismsaude.com'];
+    }
+
+    // Check role in DB - verifica se o usuário tem role ADM no Firestore
     function isStoredAdmin() {
-      return isAuthenticated() && 
+      return isAuthenticated() &&
              exists(/databases/$(database)/documents/user_profiles/$(request.auth.uid)) &&
              get(/databases/$(database)/documents/user_profiles/$(request.auth.uid)).data.role == 'ADM';
     }
 
+    // Hierarquia de admin: Custom Claim > Bootstrap > Stored Role
     function isAdmin() {
-      return isSystemAdmin() || isStoredAdmin();
+      return hasAdminClaim() || isBootstrapAdmin() || isStoredAdmin();
     }
 
     function isOwner(userId) {
       return isAuthenticated() && request.auth.uid == userId;
     }
 
+    // Verifica se é um role válido do sistema
+    function isValidRole(role) {
+      return role in ['ADM', 'Coordenador', 'Medico', 'Assistente', 'PENDING'];
+    }
+
     // --- COLLECTIONS ---
 
     match /user_profiles/{userId} {
-      // Read: Public for authenticated users (names are needed for schedule display)
+      // Read: Usuários autenticados podem ler (necessário para exibir nomes nas escalas)
       allow read: if isAuthenticated();
 
-      // Create: Owner can create their profile.
-      // Constraint: Role must be 'MEDICO' (default) unless it's a System Admin.
-      // This prevents a malicious client from sending role: 'ADM'.
-      allow create: if isOwner(userId) && (
-        isSystemAdmin() || 
-        (request.resource.data.role == 'MEDICO' && !('doctorName' in request.resource.data))
+      // Create: Usuário pode criar seu próprio perfil
+      // - Admins podem criar com qualquer role válido
+      // - Usuários normais só podem criar com role 'PENDING' ou 'Medico'
+      allow create: if isOwner(userId) && isValidRole(request.resource.data.role) && (
+        isAdmin() ||
+        request.resource.data.role in ['PENDING', 'Medico']
       );
 
-      // Update: Owner can update non-privileged fields.
-      // Role and DoctorName are PROTECTED.
-      allow update: if isAdmin() || (isOwner(userId) && (
+      // Update:
+      // - Admins podem atualizar qualquer campo
+      // - Owners podem atualizar campos não-privilegiados (role e linkedDoctorId são protegidos)
+      // - Usuários PENDING podem ser promovidos apenas por admins
+      allow update: if isAdmin() || (
+        isOwner(userId) &&
         request.resource.data.role == resource.data.role &&
-        request.resource.data.doctorName == resource.data.doctorName
-      ));
-      
+        request.resource.data.get('linkedDoctorId', null) == resource.data.get('linkedDoctorId', null)
+      );
+
+      // Delete: Apenas admins podem remover usuários
       allow delete: if isAdmin();
     }
 
+    // Schedule Store - Documento principal com dados das escalas
     match /app_data/schedule_store_v1 {
+      allow read: if isAuthenticated();
+      // Apenas admins e assistentes podem escrever
+      allow write: if isAdmin() || (
+        isAuthenticated() &&
+        exists(/databases/$(database)/documents/user_profiles/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/user_profiles/$(request.auth.uid)).data.role in ['ADM', 'Assistente']
+      );
+    }
+
+    // Subcoleções para escalabilidade futura
+    // Hospitais
+    match /hospitals/{hospitalId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+
+      // Escalas mensais por hospital
+      match /months/{monthKey} {
+        allow read: if isAuthenticated();
+        allow write: if isAdmin() || (
+          isAuthenticated() &&
+          exists(/databases/$(database)/documents/user_profiles/$(request.auth.uid)) &&
+          get(/databases/$(database)/documents/user_profiles/$(request.auth.uid)).data.role in ['ADM', 'Assistente']
+        );
+      }
+    }
+
+    // Médicos
+    match /doctors/{doctorId} {
       allow read: if isAuthenticated();
       allow write: if isAdmin();
     }
-    
-    // Default deny
+
+    // Timesheets - Folhas de ponto
+    match /timesheets/{timesheetId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin() || (
+        isAuthenticated() &&
+        exists(/databases/$(database)/documents/user_profiles/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/user_profiles/$(request.auth.uid)).data.role in ['ADM', 'Assistente']
+      );
+    }
+
+    // Histórico de alterações
+    match /history/{entryId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated(); // Qualquer usuário autenticado pode criar histórico
+      allow update, delete: if isAdmin(); // Apenas admins podem modificar/deletar histórico
+    }
+
+    // Configurações do sistema
+    match /settings/{settingId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    // Default deny - nega acesso a qualquer documento não especificado
     match /{document=**} {
       allow read, write: if false;
     }

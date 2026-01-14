@@ -139,7 +139,7 @@ export interface FinancialRule {
 
 // --- AUTH TYPES ---
 
-export type UserRole = 'ADM' | 'Coordenador' | 'Medico' | 'Assistente';
+export type UserRole = 'ADM' | 'Coordenador' | 'Medico' | 'Assistente' | 'PENDING';
 
 export interface User {
   id?: string;

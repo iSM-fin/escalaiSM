@@ -103,7 +103,7 @@ const App: React.FC = () => {
     });
 
     // --- FIRESTORE SYNC ---
-    const { status: syncStatus, errorMessage: syncErrorMessage, saveToFirestore, isSynced } = useFirestoreSync(currentUser, setStore);
+    const { status: syncStatus, errorMessage: syncErrorMessage, saveToFirestore, isSynced, retryCount } = useFirestoreSync(currentUser, setStore);
     const isAdminOrAssistant = currentUser?.role === 'ADM' || currentUser?.role === 'Assistente';
 
     // Restore Firebase session on refresh (Google/Firebase login)
@@ -112,23 +112,31 @@ const App: React.FC = () => {
             if (fbUser) {
                 (async () => {
                     try {
-                        // BYPASS: Jhoe precisa entrar. Ignorar Firestore user_profiles por enquanto.
-                        // const userRef = doc(db, 'user_profiles', fbUser.uid);
-                        // const userSnap = await getDoc(userRef);
-                        // const profile = userSnap.exists() ? userSnap.data() : {};
+                        // Busca o perfil do usuário no Firestore
+                        const userRef = doc(db, 'user_profiles', fbUser.uid);
+                        const userSnap = await getDoc(userRef);
 
-                        const restoredUser: User = {
-                            id: fbUser.uid,
-                            username: fbUser.email || 'google_user',
-                            name: fbUser.displayName || 'Usuário Recuperado',
-                            role: 'ADM', // FORCE ADM
-                            linkedDoctorId: undefined
-                        };
-                        setCurrentUser(restoredUser);
-                        setAuthSource('firebase');
-                        persistAuthState(restoredUser, 'firebase');
+                        if (userSnap.exists()) {
+                            const profile = userSnap.data();
+                            const restoredUser: User = {
+                                id: fbUser.uid,
+                                username: fbUser.email || 'google_user',
+                                name: profile.name || fbUser.displayName || 'Usuário',
+                                role: (profile.role as UserRole) || 'PENDING' as UserRole,
+                                linkedDoctorId: profile.linkedDoctorId
+                            };
+                            setCurrentUser(restoredUser);
+                            setAuthSource('firebase');
+                            persistAuthState(restoredUser, 'firebase');
+                        } else {
+                            // Usuário Firebase sem perfil - será criado no Login.tsx
+                            // Por segurança, não logamos automaticamente
+                            console.log("Usuário Firebase sem perfil. Redirecionando para login...");
+                            clearAuthState();
+                        }
                     } catch (error) {
                         console.error("Error restoring Firebase user:", error);
+                        clearAuthState();
                     }
                 })();
             } else if (authSource === 'firebase') {
@@ -172,17 +180,17 @@ const App: React.FC = () => {
         }
     }, [store, currentUser, saveToFirestore, syncStatus, isSynced]);
 
-    // Warn before leaving if saving
+    // Warn before leaving if saving or retrying
     useEffect(() => {
         const handleBeforeUnload = (e: BeforeUnloadEvent) => {
-            if (syncStatus === 'saving') {
+            if (syncStatus === 'saving' || syncStatus === 'retrying') {
                 e.preventDefault();
                 e.returnValue = '';
             }
         };
         window.addEventListener('beforeunload', handleBeforeUnload);
         return () => window.removeEventListener('beforeunload', handleBeforeUnload);
-    }, [syncStatus]); // Added syncStatus to ensure save triggers after initial load
+    }, [syncStatus]);
 
     const [activeMonth, setActiveMonth] = useState<MonthKey>(() => getMonthKey(new Date()));
     const [currentWeekIndex, setCurrentWeekIndex] = useState(() => {
@@ -1367,20 +1375,25 @@ const App: React.FC = () => {
                         )}
                         {/* Cloud Sync Status */}
                         <div className="px-3 mb-4">
-                            <div className={`flex items-center gap-2 px-3 py-2 rounded-lg border text-[10px] font-bold uppercase tracking-wider transition-colors ${syncStatus === 'saving' ? 'bg-amber-50 border-amber-200 text-amber-700 animate-pulse' :
+                            <div className={`flex items-center gap-2 px-3 py-2 rounded-lg border text-[10px] font-bold uppercase tracking-wider transition-colors ${
+                                syncStatus === 'saving' ? 'bg-amber-50 border-amber-200 text-amber-700 animate-pulse' :
+                                syncStatus === 'retrying' ? 'bg-orange-50 border-orange-200 text-orange-700 animate-pulse' :
                                 syncStatus === 'loading' ? 'bg-blue-50 border-blue-200 text-blue-700' :
-                                    syncStatus === 'error' ? 'bg-red-50 border-red-200 text-red-700' :
-                                        'bg-emerald-50 border-emerald-200 text-emerald-700'
-                                }`}>
-                                <div className={`w-1.5 h-1.5 rounded-full ${syncStatus === 'saving' ? 'bg-amber-500' :
+                                syncStatus === 'error' ? 'bg-red-50 border-red-200 text-red-700' :
+                                'bg-emerald-50 border-emerald-200 text-emerald-700'
+                            }`}>
+                                <div className={`w-1.5 h-1.5 rounded-full ${
+                                    syncStatus === 'saving' ? 'bg-amber-500' :
+                                    syncStatus === 'retrying' ? 'bg-orange-500' :
                                     syncStatus === 'loading' ? 'bg-blue-500' :
-                                        syncStatus === 'error' ? 'bg-red-500' :
-                                            'bg-emerald-500'
-                                    }`} />
+                                    syncStatus === 'error' ? 'bg-red-500' :
+                                    'bg-emerald-500'
+                                }`} />
                                 {syncStatus === 'saving' ? 'Salvando na Nuvem...' :
+                                    syncStatus === 'retrying' ? `Reconectando (${retryCount}/3)...` :
                                     syncStatus === 'loading' ? 'Conectando...' :
-                                        syncStatus === 'error' ? 'Erro ao Sincronizar' :
-                                            'Sincronizado com a Nuvem'}
+                                    syncStatus === 'error' ? 'Erro ao Sincronizar' :
+                                    'Sincronizado com a Nuvem'}
                             </div>
                             {syncErrorMessage && (
                                 <p className="mt-1 text-[9px] text-red-500 px-1 truncate">{syncErrorMessage}</p>
